@@ -1,0 +1,332 @@
+/*
+Protocol: handover authentication protocol
+Authors:  Liu Di (Beihang University)
+Date: 	  June 2022
+*/
+
+theory handover_protocol
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption, xor
+
+functions: 
+	f1/2, 	     // MAC-function --> MAC
+	f2/2, 	     // MAC-function --> RES
+	f5/2, 	     // KDF          --> AK
+	KDF/4,	     // KDF		     --> K_AP, K_AP2, and K_S-RN
+    KDFG/2,      // KDF          --> GUTI*
+	SHA256/2,    // KDF		     --> HXRES and HRES
+    encap/2,     // ECIES:KEM    --> k_UE, k_RN, and k_s
+    getkey/1,    // ECIES:KEM    --> k <-- (C, k) <-- Encap(PK, R) // R for random algorithm
+    getcipher/1, // ECIES:KEM    --> C <-- (C, k) <-- Encap(PK, R)
+    decap/2      // ECIES:KEM    --> k <-- Decap(sk, C)
+
+equations:
+    decap(sk, getcipher(encap(pk(sk), R))) = getkey(encap(pk(sk), R)) // ECIES:KEM
+
+/*
+This equation refers to the following paper:
+Wang, Y., Zhang, Z., & Xie, Y. Privacy-Preserving and Standard-Compatible AKA Protocol for 5G. 
+In 30th USENIX Security Symposium (USENIX Security 21) (pp. 3595-3612).
+*/
+
+
+//Secure channel modeling
+//Use <ch_ Name, sender, receiver> to identify the channel, representing the channel name, sender and receiver respectively
+//A. B represents the protocol entity, and m represents the message sent
+
+rule send_secure:
+	[SndS(A,B,m)]
+	-->
+	[Sec(A,B,m)]
+
+rule receive_secure:
+	[Sec(A,B,m)]
+	-->
+	[RcvS(A,B,m)]
+
+
+rule init_AS:
+    [Fr(~sk_AS)]
+    --[
+        AS_HomeNet($ID_AS)
+    ]->
+    [!AS($ID_AS, ~sk_AS),
+    !Pk($ID_AS, pk(~sk_AS)),
+    Out(<$ID_AS, pk(~sk_AS)>)]
+
+rule init_AP:
+	let 
+		ID_AP1 = <'AP1', ~idSN>
+        ID_AP2 = <'AP2', ~idSN>
+	in
+	[ Fr(~idSN) ]
+	--[ 
+        AP_ServNet(~idSN) 
+    ]->
+	[!AP1(~idSN, ID_AP1), 
+    !AP2(~idSN, ID_AP2), 
+    Out(<ID_AP1, ID_AP2>)]
+
+rule init_RN:
+    [Fr(~SUPI),
+    Fr(~k),
+    !Pk(ID_AS, pk(~sk_AS))]
+    --[
+        Subscribe(~SUPI, ID_AS),
+		ID_RN(~SUPI)
+    ]->
+    [!LTK_Sym(~SUPI, ID_AS, ~k)]
+
+
+//The entity is compromised by the attacker, resulting in the disclosure of long-term key k
+rule reveal_LTK:
+	[!LTK_Sym(~SUPI, ID_AS, ~k)]
+	--[ 
+        Rev(~SUPI, ~k),
+		Rev(ID_AS, ~k)
+	]->
+	[Out(~k)]
+
+
+
+/***********Protocol Model***********/
+rule RN_send_requset:
+    let
+        k_RN = getkey(encap(pk(~sk_AS), ~R))
+        C_RN = getcipher(encap(pk(~sk_AS), ~R))
+        // SUCI_1 = senc(~SUPI, k_RN)
+        // SUCI_2 = senc(~r_h, k_RN)
+        // SUCI = <<SUCI_1, SUCI_2>, C_RN>
+        SUCI = <senc(<~SUPI, ~r_h>, k_RN), C_RN>
+        MAC = f1(~k, <~r_h, ~SQN_RN>)
+        AK = f5(~k, ~r_h)
+		AUTN = <AK XOR ~SQN_RN, MAC>
+        msg_out = <SUCI, AUTN, ID_AS>
+    in
+    [!Pk(ID_AS, pk(~sk_AS)),
+    !LTK_Sym(~SUPI, ID_AS, ~k),
+    Fr(~R),
+    Fr(~r_h),
+    Fr(~SQN_RN)]
+    --[
+        Start_RN_Session(~SUPI),
+        Running(~SUPI, ID_AS,<'RN','AS',<'MAC', MAC>>),
+        Honest(~SUPI),
+		Honest(ID_AS)
+    ]->
+    [State_1_RN(~k, k_RN, AK, ~SUPI, ~r_h, ~SQN_RN, ID_AS),
+    Out(msg_out)]
+
+// The channel between AP and AS is assumed to be a secure channel
+rule AP1_send_AS:
+    let
+        msg_in = <SUCI, AUTN, ID_AS>
+        msg_out = <SUCI, AUTN, ID_AS, ID_AP1>
+    in
+    [!AP1(~idSN, ID_AP1),
+    In(msg_in)]
+    --[
+        Start_AP1_Session(ID_AP1)
+    ]->
+    [State_1_AP1(SUCI, AUTN, ID_AS, ID_AP1),
+    SndS(ID_AP1, ID_AS, msg_out)]
+
+rule AS_send_AP1:
+    let
+        k_RN = decap(~sk_AS, snd(SUCI))
+        //<~SUPI, ~r_h> = sdec(senc(<~SUPI, ~r_h>, k_RN), k_RN)
+        // SUPI = sdec(fst(fst(SUCI)), k_RN)
+        // r_h = sdec(snd(fst(SUCI)), k_RN)
+        SUPI = fst(sdec(fst(SUCI), k_RN))
+        r_h = snd(sdec(fst(SUCI), k_RN))
+        AK = f5(~k, r_h)
+        SQN_RN = AK XOR fst(AUTN)
+        MAC = f1(~k, <r_h, SQN_RN>) // check on the MAC 
+        AUTN = <AK XOR SQN_RN, MAC> // necessary for pattern match！
+        msg_in = <SUCI, AUTN, ID_AS, ID_AP1>
+        //
+        GUTI = KDFG(SUPI, r_h) // K_AP1
+        K_AP2 = KDF(k_RN, r_h, SQN_RN, ID_AP2)
+        MAC_star = f1(~k, <r_h, ~SQN_AS, ID_AP2>)
+        AUTN_star = <AK XOR ~SQN_AS, MAC_star>
+    in
+    [!AS(ID_AS, ~sk_AS),
+    !AP2(~idSN, ID_AP2), 
+    !LTK_Sym(~SUPI, ID_AS, ~k),
+    Fr(~SQN_AS),
+    RcvS(ID_AP1, ID_AS, msg_in)]
+    --[
+        AS_Session(ID_AS),
+        Commit(ID_AS, ~SUPI, <'RN', 'AS', <'MAC', MAC>>),
+        Running(ID_AS, ~SUPI, <'AS', 'RN', <'MAC_star', MAC_star>>),
+        Running(ID_AS, ~SUPI, <'AS', 'RN', <'K_AP2', K_AP2>>),
+        Secret(<'AS', ID_AS>, 'Key', K_AP2),
+		Secret(<'AS', ID_AS>, 'SUPI', ~SUPI),
+        Honest(~SUPI),
+		Honest(ID_AS)
+    ]->
+    [State_1_AS1(~k, k_RN, ~SUPI, r_h, SQN_RN, ~SQN_AS, ID_AS, ID_AP1, ID_AP2, GUTI, K_AP2),
+    SndS(ID_AS, ID_AP1, <AUTN_star, ID_AP2>)
+    ]
+
+rule AP1_send_RN:
+    [State_1_AP1(SUCI, AUTN, ID_AS, ID_AP1),
+    RcvS(ID_AS, ID_AP1, <AUTN_star, ID_AP2>)]
+    --[
+        AP1_END()
+    ]->
+    [State_2_AP1(SUCI, AUTN, ID_AS, ID_AP1, ID_AP2),
+    Out(<AUTN_star, ID_AP2>)]
+
+rule RN_response:
+    let
+        SQN_AS = AK XOR fst(AUTN_star)
+        MAC_star = f1(~k, <~r_h, SQN_AS, ID_AP2>) // check on the MAC 
+        AUTN_star = <AK XOR SQN_AS, MAC_star> // necessary for pattern match！
+        GUTI = KDFG(~SUPI, ~r_h) // K_AP1
+        K_AP2 = KDF(k_RN, ~r_h, ~SQN_RN, ID_AP2)
+    in
+    [State_1_RN(~k, k_RN, AK, ~SUPI, ~r_h, ~SQN_RN, ID_AS),
+    In(<AUTN_star, ID_AP2>)]
+    --[
+        AS_END(),
+        Commit(~SUPI, ID_AS, <'AS', 'RN', <'MAC_star', MAC_star>>),
+        Commit(~SUPI, ID_AS, <'AS', 'RN', <'K_AP2', K_AP2>>),
+        Secret(<'RN', ~SUPI>, 'Key', K_AP2),
+		Secret(<'RN', ~SUPI>, 'SUPI', ~SUPI),
+        Honest(~SUPI),
+		Honest(ID_AS)
+    ]->
+    [State_2_RN(~k, k_RN, AK, ~SUPI, ~r_h, ~SQN_RN, SQN_AS, ID_AS, GUTI, K_AP2)]
+
+
+
+
+/****** Restriction ******/
+
+restriction Subscribe_once:
+" 
+    All AS1 AS2 SUPI #i #j. Subscribe(SUPI, AS1) @i & Subscribe(SUPI, AS2) @j 
+        ==> #i = #j
+"
+
+restriction AP_ServNet_once:
+" 
+    All SN1 SN2 #i #j. AP_ServNet(SN1) @i & AP_ServNet(SN2) @j 
+        ==> #i = #j
+"
+
+restriction AS_Homenet_once:
+" 
+    All AS1 AS2 #i #j. AS_HomeNet(AS1) @i & AS_HomeNet(AS2) @j 
+        ==> #i = #j
+"
+
+
+
+/****** Security Properties ******/
+
+lemma Executable: exists-trace
+"
+    Ex SUPI #i #j. Start_RN_Session(SUPI) @i & AS_END() @j
+        & not (Ex X k #r. Rev(X, k) @r)
+        //& (All RN1 RN2 #j #k. Start_RN_Session(RN1) @j & Start_RN_Session(RN2) @k ==> #j = #k)
+" 
+
+lemma Secrecy_SUPI_RN:
+"
+    All SUPI t #i. Secret(<'RN', SUPI>, 'SUPI', t) @i
+        ==> not (Ex #j. K(t) @j)
+        | (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+"
+
+lemma Secrecy_SUPI_AS:
+"
+    All ID_AS t #i. Secret(<'AS', ID_AS>, 'SUPI', t) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> not (Ex #j. K(t) @j)
+"
+/* // verified
+lemma Secrecy_session_key_RN:
+"
+    All SUPI t #i. Secret(<'RN', SUPI>, 'Key', t) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> not (Ex #j. K(t) @j)
+"
+*/
+lemma PFS_session_key:
+"
+    All SUPI t #i. Secret(<'RN', SUPI>, 'Key', t) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i & r < i)
+        ==> not (Ex #j. K(t) @j)
+"
+/* // not terminate
+lemma Secrecy_session_key_AS:
+"
+   All ID_AS t #i. Secret(<'AS', ID_AS>, 'Key', t) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> not (Ex #j. K(t) @j)
+"
+*//*
+lemma PFS_session_key_AS:
+"
+   All ID_AS t #i. Secret(<'AS', ID_AS>, 'Key', t) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i & r < i)
+       ==> not (Ex #j. K(t) @j)
+"
+*/
+
+lemma AS_auth_RN:
+"
+    All a b t #i. Commit(a, b, <'RN', 'AS', <'MAC', t>>) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> (Ex #j. Running(b, a, <'RN', 'AS', <'MAC', t>>) @j & j < i)
+"
+
+/* //no need and failed verified
+lemma AS_auth_RN_injective:
+"
+    All a b t #i. Commit(a, b, <'RN', 'AS', <'MAC', t>>) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> (Ex #j. Running(b, a, <'RN', 'AS', <'MAC', t>>) @j
+            & j < i
+            & not (Ex a2 b2 #i2. Commit(a2, b2, <'RN', 'AS', <'MAC', t>>) @i2
+            & not(#i2 = #i)))
+"
+*/
+/* // verified
+lemma RN_auth_AS_injective:
+"
+    All a b t #i. Commit(a, b, <'AS', 'RN', <'MAC_star', t>>) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> (Ex #j. Running(b, a, <'AS', 'RN', <'MAC_star', t>>) @j
+            & j < i
+            & not (Ex a2 b2 #i2. Commit(a2, b2, <'AS', 'RN', <'MAC_star', t>>) @i2
+            & not(#i2 = #i)))
+"
+*//* // verified
+lemma RN_auth_AS_and_key_noninjective_agreement:
+"
+    All a b t #i. Commit(a, b, <'AS', 'RN', <'K_AP2', t>>) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> (Ex #j. Running(b, a, <'AS', 'RN', <'K_AP2', t>>) @j)
+"
+*/
+
+lemma RN_auth_AS_and_key_injective_agreement:
+"
+    All a b t #i. Commit(a, b, <'AS', 'RN', <'K_AP2', t>>) @i
+        & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i)
+        ==> (Ex #j. Running(b, a, <'AS', 'RN', <'K_AP2', t>>) @j
+            & j < i
+            & not (Ex a2 b2 #i2. Commit(a2, b2, <'AS', 'RN', <'K_AP2', t>>) @i2
+            & not(#i2 = #i)))
+"
+
+
+
+
+
+
+end
