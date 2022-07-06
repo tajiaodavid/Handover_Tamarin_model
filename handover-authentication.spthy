@@ -261,7 +261,7 @@ lemma PFS_session_key:
         & not (Ex X k #r. Rev(X, k) @r & Honest(X) @i & r < i)
         ==> not (Ex #j. K(t) @j)
 "
-/* // not terminate
+/* // verified by interactive mode
 lemma Secrecy_session_key_AS:
 "
    All ID_AS t #i. Secret(<'AS', ID_AS>, 'Key', t) @i
